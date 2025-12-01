@@ -1,6 +1,9 @@
+// pages/api/frame/result.ts (or similar)
+
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { redis } from '../../../lib/redisClient';
 import { supabaseAdmin } from '../../../lib/supabaseClient';
+import type { VideoFramesPayload, FrameAnalysis } from '../../../lib/types'; // adjust path
 
 const REQUIRED_SECRET = process.env.INGESTION_API_KEY;
 
@@ -15,21 +18,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { video_id, frames } = req.body as {
-      video_id: string;
-      frames: Array<{
-        frame_number: number;
-        timestamp_ms: number;
-        actors: any[];
-        objects: string[];
-        scene_score: number;
-        emotion_dominant: string | null;
-        emotion_distribution: Record<string, number>;
-      }>;
-    };
+    const { video_id, frames } = req.body as VideoFramesPayload;
 
     if (!video_id || !Array.isArray(frames) || frames.length === 0) {
-      return res.status(400).json({ error: 'Invalid input — expected video_id and frames[]' });
+      return res.status(400).json({ error: 'Invalid input — expected video_id and non-empty frames[]' });
     }
 
     // -------------------------------------------------------------
@@ -37,15 +29,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // -------------------------------------------------------------
     const pipeline = redis.pipeline();
 
-    frames.forEach(frame => {
+    frames.forEach((frame: FrameAnalysis) => {
       const key = `video:${video_id}:frame:${frame.frame_number}`;
+
       pipeline.hmset(key, {
         video_id,
         frame_number: String(frame.frame_number),
         timestamp_ms: String(frame.timestamp_ms),
-        actors: JSON.stringify(frame.actors),
-        objects: JSON.stringify(frame.objects),
-        scene_score: String(frame.scene_score ?? ''),
+        actors: JSON.stringify(frame.actors ?? []),
+        objects: JSON.stringify(frame.objects ?? []),
+        scene_score: String(frame.scene_score ?? 0),
         emotion_dominant: frame.emotion_dominant ?? '',
         emotion_distribution: JSON.stringify(frame.emotion_distribution ?? {})
       });
@@ -53,19 +46,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await pipeline.exec();
 
-
     // -------------------------------------------------------------
     // 🚀 SINGLE BULK INSERT INTO SUPABASE
     // -------------------------------------------------------------
-    const bulkInsertPayload = frames.map(frame => ({
+    const bulkInsertPayload = frames.map((frame: FrameAnalysis) => ({
       video_id,
       frame_number: frame.frame_number,
       timestamp_ms: frame.timestamp_ms,
-      actors: frame.actors,
-      objects: frame.objects,
-      scene_score: frame.scene_score,
+      actors: frame.actors ?? [],
+      objects: frame.objects ?? [],
+      scene_score: frame.scene_score ?? 0,
       emotion_dominant: frame.emotion_dominant,
-      emotion_distribution: frame.emotion_distribution
+      emotion_distribution: frame.emotion_distribution ?? {}
     }));
 
     const { error } = await supabaseAdmin.from('frames').insert(bulkInsertPayload);
@@ -76,12 +68,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // ensure video exists once
-    await supabaseAdmin.from('videos').upsert({ id: video_id }, { onConflict: 'id' });
+    await supabaseAdmin.from('videos').upsert(
+      { id: video_id },
+      { onConflict: 'id' }
+    );
 
     return res.status(200).json({
       status: 'ok',
       inserted_frames: frames.length,
-      message: "Bulk ingest successful 🚀"
+      message: 'Bulk ingest successful 🚀'
     });
 
   } catch (err) {
