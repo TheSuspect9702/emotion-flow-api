@@ -1,7 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { redis } from '../../../lib/redisClient';
 import { supabaseAdmin } from '../../../lib/supabaseClient';
-import type { FramePayload } from '../../../lib/types';
 
 const REQUIRED_SECRET = process.env.INGESTION_API_KEY;
 
@@ -10,56 +9,83 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.replace('Bearer ', '');
-
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!REQUIRED_SECRET || token !== REQUIRED_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   try {
-    const body = req.body as FramePayload;
+    const { video_id, frames } = req.body as {
+      video_id: string;
+      frames: Array<{
+        frame_number: number;
+        timestamp_ms: number;
+        actors: any[];
+        objects: string[];
+        scene_score: number;
+        emotion_dominant: string | null;
+        emotion_distribution: Record<string, number>;
+      }>;
+    };
 
-    if (!body.video_id || typeof body.frame_number !== 'number') {
-      return res.status(400).json({ error: 'Missing video_id or frame_number' });
+    if (!video_id || !Array.isArray(frames) || frames.length === 0) {
+      return res.status(400).json({ error: 'Invalid input — expected video_id and frames[]' });
     }
 
-    const frameKey = `video:${body.video_id}:frame:${body.frame_number}`;
+    // -------------------------------------------------------------
+    // 🚀 REDIS BULK PIPELINE — One network operation instead of N
+    // -------------------------------------------------------------
+    const pipeline = redis.pipeline();
 
-    await redis.hmset(frameKey, {
-      video_id: body.video_id,
-      frame_number: body.frame_number.toString(),
-      timestamp_ms: body.timestamp_ms.toString(),
-      actors: JSON.stringify(body.actors ?? []),
-      objects: JSON.stringify(body.objects ?? []),
-      scene_score: body.scene_score?.toString() ?? '',
-      emotion_dominant: body.emotion_dominant ?? '',
-      emotion_distribution: JSON.stringify(body.emotion_distribution ?? {})
+    frames.forEach(frame => {
+      const key = `video:${video_id}:frame:${frame.frame_number}`;
+      pipeline.hmset(key, {
+        video_id,
+        frame_number: String(frame.frame_number),
+        timestamp_ms: String(frame.timestamp_ms),
+        actors: JSON.stringify(frame.actors),
+        objects: JSON.stringify(frame.objects),
+        scene_score: String(frame.scene_score ?? ''),
+        emotion_dominant: frame.emotion_dominant ?? '',
+        emotion_distribution: JSON.stringify(frame.emotion_distribution ?? {})
+      });
     });
 
-    const { error: insertError } = await supabaseAdmin.from('frames').insert({
-      video_id: body.video_id,
-      frame_number: body.frame_number,
-      timestamp_ms: body.timestamp_ms,
-      actors: body.actors ?? [],
-      objects: body.objects ?? [],
-      scene_score: body.scene_score ?? null,
-      emotion_dominant: body.emotion_dominant ?? null,
-      emotion_distribution: body.emotion_distribution ?? {}
-    });
+    await pipeline.exec();
 
-    if (insertError) {
-      console.error('Supabase insert error:', insertError);
-      return res.status(500).json({ error: 'Failed to insert into Supabase' });
+
+    // -------------------------------------------------------------
+    // 🚀 SINGLE BULK INSERT INTO SUPABASE
+    // -------------------------------------------------------------
+    const bulkInsertPayload = frames.map(frame => ({
+      video_id,
+      frame_number: frame.frame_number,
+      timestamp_ms: frame.timestamp_ms,
+      actors: frame.actors,
+      objects: frame.objects,
+      scene_score: frame.scene_score,
+      emotion_dominant: frame.emotion_dominant,
+      emotion_distribution: frame.emotion_distribution
+    }));
+
+    const { error } = await supabaseAdmin.from('frames').insert(bulkInsertPayload);
+
+    if (error) {
+      console.error('Supabase bulk insert error:', error);
+      return res.status(500).json({ error: 'Supabase bulk insert failed' });
     }
 
-    await supabaseAdmin
-      .from('videos')
-      .upsert({ id: body.video_id }, { onConflict: 'id' });
+    // ensure video exists once
+    await supabaseAdmin.from('videos').upsert({ id: video_id }, { onConflict: 'id' });
 
-    return res.status(200).json({ status: 'ok' });
+    return res.status(200).json({
+      status: 'ok',
+      inserted_frames: frames.length,
+      message: "Bulk ingest successful 🚀"
+    });
+
   } catch (err) {
-    console.error('Error in /api/frame/result', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error(err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
