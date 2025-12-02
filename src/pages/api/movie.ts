@@ -1,26 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { IncomingForm, File as FormidableFile } from 'formidable';
-import fs from 'fs';
 import FormData from 'form-data';
 import axios from 'axios';
 import { supabaseAdmin } from '../../lib/supabaseClient';
 import { randomUUID } from 'crypto';
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
-
-const parseForm = async (req: NextApiRequest): Promise<{ fields: any; files: any }> => {
-  return new Promise((resolve, reject) => {
-    const form = new IncomingForm();
-    form.parse(req, (err, fields, files) => {
-      if (err) reject(err);
-      resolve({ fields, files });
-    });
-  });
-};
+// NOTE: The 'config' export with bodyParser: false has been removed.
+// Next.js will now automatically parse the JSON body containing the filePath.
 
 function escapeRegExp(string: string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -43,15 +28,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { files } = await parseForm(req);
-    const uploadedFile = Array.isArray(files.file) ? files.file[0] : (files.file as FormidableFile);
+    // 1. Receive metadata from client (Client has already uploaded the file to Supabase Storage)
+    const { filePath, originalFilename } = req.body;
 
-    if (!uploadedFile) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    if (!filePath || !originalFilename) {
+      return res.status(400).json({ error: 'Missing filePath or originalFilename in request body' });
     }
 
     const videoId = randomUUID();
-    let originalTitle = uploadedFile.originalFilename || 'untitled_video';
+    let originalTitle = originalFilename || 'untitled_video';
     
     // --- Versioning Logic ---
     const lastDotIndex = originalTitle.lastIndexOf('.');
@@ -94,7 +79,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
     
-    // --- Supabase Insert ---
+    // --- Supabase Insert (Database Record) ---
     const { error: dbError } = await supabaseAdmin.from('videos').insert({
       id: videoId,
       title: finalTitle,
@@ -105,9 +90,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(500).json({ error: 'Database insertion failed' });
     }
 
+    // --- Retrieve File from Supabase Storage ---
+    const { data: fileBlob, error: downloadError } = await supabaseAdmin
+      .storage
+      .from('videos') 
+      .download(filePath);
+
+    if (downloadError) {
+      console.error('Supabase storage download error:', downloadError);
+      return res.status(500).json({ error: 'Failed to retrieve file from storage' });
+    }
+
+    // Convert the blob to a Buffer to send via FormData
+    const arrayBuffer = await fileBlob.arrayBuffer();
+    const fileBuffer = Buffer.from(arrayBuffer);
+
     // --- Colab Forwarding ---
     const formData = new FormData();
-    formData.append('file', fs.createReadStream(uploadedFile.filepath));
+    formData.append('file', fileBuffer, finalTitle); // Send with the final versioned name
     formData.append('video_id', videoId);
     
     const colabResponse = await axios.post(
@@ -117,7 +117,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         headers: {
           ...formData.getHeaders(),
         },
-        maxBodyLength: Infinity,
+        maxBodyLength: Infinity, // Allow large payloads in Axios
       }
     );
 
